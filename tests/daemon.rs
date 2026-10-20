@@ -254,3 +254,19 @@ fn closed_stdout_exits_quietly() {
     assert!(!stderr.contains("panicked"), "panicked on closed stdout: {stderr}");
     assert_eq!(out.status.code(), Some(0), "stderr: {stderr}");
 }
+
+#[test]
+fn version_works_without_a_daemon() {
+    let home = std::env::temp_dir().join(format!("bsched-version-{}", std::process::id()));
+    for args in [vec!["--version"], vec!["-V"], vec!["version"]] {
+        let out = Command::new(BIN).arg("--home").arg(&home).args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("boss-sched {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+    let out = Command::new(BIN).args(["--json", "--version"]).output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+}

@@ -36,6 +36,7 @@ boss-sched - tiny always-on job scheduler
 usage: boss-sched [--home DIR] [--json] <command>
 
   daemon                     run the scheduler (single instance; extra copies exit 0)
+  version                    print the binary version (also --version, -V); no daemon needed
   status                     daemon pid, uptime, job counts (exit 3 if not running)
   list                       all jobs
   add --file JOB.json [--test-run]
@@ -115,6 +116,14 @@ fn real_main() -> Result<i32, String> {
         None => PathBuf::from(std::env::var("HOME").map_err(|_| "HOME is not set")?).join(".boss/scheduler"),
     };
     let json_out = a.flag("--json");
+    if a.flag("--version") || a.flag("-V") || a.0.first().is_some_and(|c| c == "version") {
+        if json_out {
+            outln!("{}", json!({"version": env!("CARGO_PKG_VERSION")}));
+        } else {
+            outln!("boss-sched {}", env!("CARGO_PKG_VERSION"));
+        }
+        return Ok(0);
+    }
     if a.0.is_empty() || a.flag("--help") || a.flag("-h") {
         outln!("{USAGE}");
         return Ok(0);

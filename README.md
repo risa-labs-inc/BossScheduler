@@ -156,6 +156,7 @@ replayed; the slot is considered consumed.
 boss-sched [--home DIR] [--json] <command>
 
   daemon                     run the scheduler (extra copies exit 0)
+  version                    binary version (also --version, -V); works without the daemon
   status                     pid, uptime, job counts (exit 3 if not running)
   list                       all jobs with next run, last status, failures
   add --file JOB.json [--test-run]
