@@ -228,7 +228,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.rever.boss.scheduler.
 or `BOSS_SCHED_HOME`), `RunAtLoad`, `KeepAlive` with `SuccessfulExit` false
 so only a failure restarts it, logging to `<home>/daemon.log` (by default
 `~/.boss/scheduler/daemon.log`), and your current `PATH` so jobs can find
-tools. It never calls `launchctl`; loading is your step.
+tools (entries starting with `~` are expanded to your home, since launchd
+does not expand them). It never calls `launchctl`; loading is your step.
 `print-agent` shows what it would write, and
 `launchd/ai.rever.boss.scheduler.plist.template` is the same thing with
 placeholders. `uninstall-agent` removes the file; unload with
@@ -261,7 +262,8 @@ loginctl enable-linger $USER # optional: keep running while logged out
 ```
 
 The unit has the absolute binary path (plus `--home` with an absolute path
-only for a custom home from `--home` or `BOSS_SCHED_HOME`), your current `PATH`,
+only for a custom home from `--home` or `BOSS_SCHED_HOME`), your current `PATH`
+(entries starting with `~` expanded to your home),
 `Restart=on-failure` and appends to `<home>/daemon.log` (by default
 `~/.boss/scheduler/daemon.log`). It uses
 `KillMode=mixed`: `systemctl stop` sends SIGTERM to the daemon alone, which
