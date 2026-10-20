@@ -345,6 +345,8 @@ fn stop_run(d: &Daemon, key: &str, why: &'static str) {
 /// leaves `live` and shutdown does not wait out its full grace for it. Takes
 /// only the `live` lock (fine with or without `state` held, per the lock
 /// order) and tolerates a poisoned one, so it cannot panic while unwinding.
+/// If the run thread is panicking, its process group (if one was spawned) is
+/// SIGKILLed after the lock is released, so no group is left untracked.
 struct LiveEntry<'a> {
     d: &'a Daemon,
     key: String,
@@ -352,7 +354,12 @@ struct LiveEntry<'a> {
 
 impl Drop for LiveEntry<'_> {
     fn drop(&mut self) {
-        self.d.live.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+        let removed = self.d.live.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+        if thread::panicking()
+            && let Some(pgid) = removed.and_then(|e| e.pgid)
+        {
+            runner::signal_group(pgid, libc::SIGKILL);
+        }
     }
 }
 
@@ -856,6 +863,24 @@ mod tests {
         let h = &st.history["j"];
         assert_eq!((h.len(), h[0].status), (1, Status::Interrupted));
         assert!(h[0].detail.as_deref().unwrap().contains("pid 999999 gone"));
+    }
+
+    #[test]
+    fn recover_reports_dead_pid_without_start_time_as_gone() {
+        // A reaped child's pid is dead; with no recorded start time it is
+        // neither verifiable nor alive, so it must read as gone.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let mut st = state_with(false);
+        st.jobs[0].state.running = Some(Running {
+            pid: Some(pid),
+            pid_start: None,
+            ..running()
+        });
+        recover(&mut st, Utc::now(), Duration::from_secs(1));
+        let d = st.history["j"][0].detail.clone().unwrap();
+        assert!(d.contains(&format!("pid {pid} gone")), "{d}");
     }
 
     #[test]
