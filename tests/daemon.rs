@@ -166,9 +166,17 @@ fn downtime_coalesces_into_one_catch_up_run() {
     wait_for(|| !history(&home, "every-min").is_empty(), 5, "catch-up run");
     std::thread::sleep(Duration::from_millis(1500));
     let h = history(&home, "every-min");
-    assert_eq!(h.len(), 1, "expected exactly one catch-up run, got {h:?}");
     assert_eq!(h[0]["trigger"], "catch_up");
     assert!(h[0]["missed_slots"].as_u64().unwrap() >= 10, "{}", h[0]);
+    // One catch-up only. A minute boundary during the wait can add one
+    // ordinary on-time run, which is correct, not a storm.
+    assert!(
+        h[1..]
+            .iter()
+            .all(|r| r["trigger"] == "schedule" && r["missed_slots"] == 1)
+            && h.len() <= 2,
+        "expected one catch-up run, got {h:?}"
+    );
     stop(d);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -208,7 +216,8 @@ fn restart_records_interrupted_and_sigterm_leaves_no_orphans() {
     assert_eq!(h.len(), 1);
     assert_eq!(h[0]["status"], "interrupted");
 
-    // Hard kill: the next process detects the dead run and records it, no replay.
+    // Hard kill: the run survives the daemon, and the next process finds it,
+    // terminates its group and records it, with no replay.
     std::fs::remove_file(&pidfile).unwrap();
     req(&home, json!({"cmd": "run_now", "id": "slow"}));
     wait_for(
@@ -223,17 +232,101 @@ fn restart_records_interrupted_and_sigterm_leaves_no_orphans() {
     let mut d = d;
     d.0.kill().unwrap();
     d.0.wait().unwrap();
+    assert!(pid_alive(g2), "a hard kill cannot take the run with it");
     let d = start(&home);
     let h = history(&home, "slow");
     assert_eq!(h.len(), 2);
     assert_eq!(h[1]["status"], "interrupted");
-    assert!(h[1]["detail"].as_str().unwrap().contains("still alive"), "{}", h[1]);
+    assert!(
+        h[1]["detail"].as_str().unwrap().contains("process group terminated"),
+        "{}",
+        h[1]
+    );
     let job = &req(&home, json!({"cmd": "get", "id": "slow"}));
     assert!(job["state"]["running"].is_null());
-    assert!(pid_alive(g2), "a hard kill cannot take the run with it");
-    // Clean up the orphan group the hard kill left behind.
-    unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
-    wait_for(|| !pid_alive(g2), 3, "orphan cleanup");
+    let reaped = Instant::now() + Duration::from_secs(3);
+    while pid_alive(g2) && Instant::now() < reaped {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if pid_alive(g2) {
+        unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+        panic!("recovery left the previous daemon's run alive");
+    }
+    stop(d);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+fn slow_job(home: &Path, id: &str, secs: u32) {
+    req(
+        home,
+        json!({"cmd": "add", "job": {"id": id, "name": id,
+        "command": ["/bin/sh", "-c", format!("sleep {secs} & echo $! > {id}.pid; wait")], "cwd": home,
+        "schedule": {"kind": "cron", "expr": "0 0 1 1 *", "tz": "UTC"}}}),
+    );
+}
+
+#[test]
+fn sigterm_right_after_run_now_leaves_no_orphan() {
+    // The run is still spawning when SIGTERM lands; it must be stopped (or
+    // never started), not left running with PPID 1.
+    let home = temp_home("racestop");
+    for i in 0..10 {
+        let d = start(&home);
+        let id = format!("s{i}");
+        slow_job(&home, &id, 30);
+        req(&home, json!({"cmd": "run_now", "id": id}));
+        stop(d);
+        // If it spawned, its grandchild wrote a pid; give it a moment to.
+        std::thread::sleep(Duration::from_millis(200));
+        if let Ok(s) = std::fs::read_to_string(home.join(format!("{id}.pid")))
+            && let Ok(pid) = s.trim().parse::<i64>()
+        {
+            assert!(!pid_alive(pid), "iteration {i}: run {pid} outlived the daemon");
+        }
+        let d = start(&home);
+        let h = history(&home, &id);
+        assert_eq!(h.len(), 1, "iteration {i}: {h:?}");
+        assert_eq!(h[0]["status"], "interrupted");
+        stop(d);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn remove_stops_the_run_and_a_re_added_job_is_unaffected() {
+    let home = temp_home("readd");
+    let d = start(&home);
+    slow_job(&home, "x", 30);
+    req(&home, json!({"cmd": "run_now", "id": "x"}));
+    let pidfile = home.join("x.pid");
+    wait_for(
+        || std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n')),
+        5,
+        "first run",
+    );
+    let first: i64 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    std::fs::remove_file(&pidfile).unwrap();
+    req(&home, json!({"cmd": "remove", "id": "x"}));
+    wait_for(|| !pid_alive(first), 5, "removed job's run to stop");
+
+    slow_job(&home, "x", 30);
+    req(&home, json!({"cmd": "run_now", "id": "x"}));
+    wait_for(
+        || std::fs::read_to_string(&pidfile).is_ok_and(|s| s.ends_with('\n')),
+        5,
+        "second run",
+    );
+    // Give the first run's thread time to finish and (not) apply its outcome.
+    std::thread::sleep(Duration::from_millis(500));
+    let job = req(&home, json!({"cmd": "get", "id": "x"}));
+    assert!(!job["state"]["running"].is_null(), "new run lost its tracking: {job}");
+    assert!(job["state"]["last_status"].is_null(), "{job}");
+    assert!(history(&home, "x").is_empty());
+    let mut s = UnixStream::connect(home.join("scheduler.sock")).unwrap();
+    writeln!(s, "{}", json!({"cmd": "run_now", "id": "x"})).unwrap();
+    let mut line = String::new();
+    BufReader::new(&s).read_line(&mut line).unwrap();
+    assert!(line.contains("already running"), "{line}");
     stop(d);
     let _ = std::fs::remove_dir_all(&home);
 }

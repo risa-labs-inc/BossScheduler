@@ -163,6 +163,56 @@ pub fn pid_alive(pid: u32) -> bool {
     pid > 1 && unsafe { libc::kill(pid as i32, 0) } == 0
 }
 
+/// SIGTERM a group that is not our child (e.g. left over from a previous
+/// daemon), wait up to `grace` for it to go, then SIGKILL.
+pub fn terminate_group(pgid: i32, grace: Duration) {
+    signal_group(pgid, libc::SIGTERM);
+    let deadline = Instant::now() + grace;
+    while group_alive(pgid) && Instant::now() < deadline {
+        thread::sleep(POLL);
+    }
+    signal_group(pgid, libc::SIGKILL);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while group_alive(pgid) && Instant::now() < deadline {
+        thread::sleep(POLL);
+    }
+}
+
+/// When a process started, in an opaque OS unit. Recorded next to a run's
+/// pid so a restarted daemon can tell its old child from a reused pid.
+#[cfg(target_os = "linux")]
+pub fn process_start(pid: u32) -> Option<u64> {
+    // Field 22 of /proc/PID/stat (clock ticks since boot). The command name
+    // (field 2) may contain spaces, so count from the last ')'.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_start(pid: u32) -> Option<u64> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_start(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// Drain a pipe on a thread, keeping only the last OUTPUT_CAP bytes.
 fn capture<R: Read + Send + 'static>(mut r: R) -> Receiver<String> {
     let (tx, rx) = mpsc::channel();
@@ -276,6 +326,19 @@ mod tests {
         assert_eq!(o.status, Status::Success);
         assert!(o.detail.unwrap().contains("leftover"));
         assert_dead(o.stdout.trim().parse().unwrap());
+    }
+
+    #[test]
+    fn process_start_identifies_a_live_process() {
+        let me = std::process::id();
+        let a = process_start(me);
+        assert!(a.is_some());
+        assert_eq!(a, process_start(me), "stable for the same process");
+        let mut c = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        assert_ne!(process_start(c.id()), None);
+        c.kill().unwrap();
+        c.wait().unwrap();
+        assert_eq!(process_start(c.id()), None, "gone once reaped");
     }
 
     #[test]

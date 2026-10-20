@@ -47,9 +47,11 @@ usage: boss-sched [--home DIR] [--json] <command>
   remove <id> | enable <id> | disable <id>
   run-now <id> [--wait]      start a run immediately (does not move the schedule)
   history <id> [--limit N] [--full]
-  install-agent              write ~/Library/LaunchAgents/ai.rever.boss.scheduler.plist (does not load it)
-  uninstall-agent            remove that plist (does not unload it)
-  print-agent                print the plist that install-agent would write
+  install-agent              write the login service (does not start it): macOS
+                             ~/Library/LaunchAgents/ai.rever.boss.scheduler.plist,
+                             Linux ~/.config/systemd/user/boss-scheduler.service
+  uninstall-agent            remove that file (does not stop the service)
+  print-agent                print what install-agent would write
 
 home defaults to $BOSS_SCHED_HOME or ~/.boss/scheduler";
 
@@ -208,19 +210,7 @@ fn real_main() -> Result<i32, String> {
         }
         "install-agent" => outln!("{}", agent::install(&home, custom_home.is_some())?),
         "uninstall-agent" => outln!("{}", agent::uninstall()?),
-        "print-agent" => {
-            let bin = std::env::current_exe().map_err(|e| e.to_string())?;
-            let path = std::env::var("PATH").unwrap_or_default();
-            out!(
-                "{}",
-                agent::plist(
-                    &bin,
-                    custom_home.is_some().then_some(home.as_path()),
-                    &home.join("daemon.log"),
-                    &path
-                )
-            );
-        }
+        "print-agent" => out!("{}", agent::render(&home, custom_home.is_some())?),
         other => return Err(format!("unknown command '{other}' (try --help)")),
     }
     Ok(0)

@@ -3,12 +3,16 @@
 //! Concurrency: one mutex around `State`. Every mutation is saved to disk
 //! before the lock is released, so the process can be killed at any moment.
 //! Children are spawned and waited on outside the lock, one thread per run.
+//! Every run thread is also in `Daemon::live` from before it spawns until its
+//! outcome is saved, so shutdown can find (and wait for) all of them. Lock
+//! order: `state` before `live`, never the reverse.
 
 use crate::job::{Decision, Job, JobSpec, NOTIFY_AFTER_FAILURES, RunRecord, Running, Status, Trigger};
 use crate::runner;
 use crate::store::State;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -49,7 +53,19 @@ struct Daemon {
     wake: Condvar,
     shutting_down: AtomicBool,
     started_at: DateTime<Utc>,
+    /// run id (or `<run id>:notify`) -> its process group once spawned.
+    live: Mutex<HashMap<String, Live>>,
 }
+
+#[derive(Default)]
+struct Live {
+    pgid: Option<i32>,
+    /// Set when the scheduler (not the job) ended the run, and why.
+    stopped: Option<&'static str>,
+}
+
+const STOPPED_SHUTDOWN: &str = "scheduler shut down during the run; process group terminated";
+const STOPPED_REMOVED: &str = "job was removed during the run; process group terminated";
 
 static SIGNALED: AtomicBool = AtomicBool::new(false);
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -96,10 +112,11 @@ pub fn run(home: &Path) -> Result<i32, String> {
     fs::set_permissions(home, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
     let Some(_lock) = acquire_lock(&paths.lock).map_err(|e| format!("lock: {e}"))? else {
         log(format!("another instance holds {}; exiting", paths.lock.display()));
-        return Ok(0); // exit 0 so launchd KeepAlive does not loop on us
+        // Exit 0: the agents restart only on failure, so this does not loop.
+        return Ok(0);
     };
     let mut state = State::load(&paths.state)?;
-    recover(&mut state, Utc::now());
+    recover(&mut state, Utc::now(), Duration::from_secs(10));
     state.save(&paths.state)?;
 
     let _ = fs::remove_file(&paths.socket);
@@ -121,6 +138,7 @@ pub fn run(home: &Path) -> Result<i32, String> {
         wake: Condvar::new(),
         shutting_down: AtomicBool::new(false),
         started_at: Utc::now(),
+        live: Mutex::new(HashMap::new()),
     });
     log(format!("started pid {} home {}", std::process::id(), home.display()));
     let waiter = d.clone();
@@ -138,14 +156,20 @@ pub fn run(home: &Path) -> Result<i32, String> {
             thread::spawn(move || serve(&d, conn));
         }
     });
+    // The loop holds the state lock except while waiting, so a notify from
+    // add/enable/a finished run (all sent under the lock) is never lost.
+    let mut st = d.state.lock().unwrap();
     loop {
-        let wait = tick(&d, Utc::now());
-        let guard = d.state.lock().unwrap();
         if SIGNALED.load(Ordering::SeqCst) {
             break;
         }
-        let _ = d.wake.wait_timeout(guard, wait).unwrap();
+        let wait = tick(&d, &mut st, Utc::now());
+        if SIGNALED.load(Ordering::SeqCst) {
+            break;
+        }
+        st = d.wake.wait_timeout(st, wait).unwrap().0;
     }
+    drop(st);
     shutdown(&d);
     let _ = fs::remove_file(&d.paths.socket);
     log("stopped");
@@ -153,18 +177,28 @@ pub fn run(home: &Path) -> Result<i32, String> {
 }
 
 /// Startup recovery: runs that were live when the previous process died are
-/// recorded as interrupted. Their payloads are never replayed.
-pub fn recover(state: &mut State, now: DateTime<Utc>) {
+/// recorded as interrupted, and a leftover process group is terminated so it
+/// cannot outlive its timeout or overlap the next run. A pid is only signalled
+/// when its start time matches the one recorded, so a reused pid is never hit.
+/// Payloads are never replayed.
+pub fn recover(state: &mut State, now: DateTime<Utc>, grace: Duration) {
     let mut records = vec![];
     for job in &mut state.jobs {
         if let Some(r) = job.state.running.take() {
-            let alive = r.pid.is_some_and(runner::pid_alive);
-            let detail = match r.pid {
-                Some(pid) => format!(
-                    "scheduler restarted while run was live (pid {pid} {}); not replayed",
-                    if alive { "still alive, left untouched" } else { "gone" }
-                ),
-                None => "scheduler restarted before the run spawned; not replayed".into(),
+            let ours = r
+                .pid
+                .filter(|&p| r.pid_start.is_some() && runner::process_start(p) == r.pid_start);
+            let detail = match (r.pid, ours) {
+                (Some(pid), Some(_)) => {
+                    runner::terminate_group(pid as i32, grace.min(Duration::from_secs(job.spec.kill_grace_seconds)));
+                    format!(
+                        "scheduler restarted while run was live (pid {pid} still alive, process group terminated); not replayed"
+                    )
+                }
+                (Some(pid), None) => format!("scheduler restarted while run was live (pid {pid} gone); not replayed"),
+                // A crash between spawn and saving the pid lands here; that
+                // child cannot be identified, so it is left alone.
+                (None, _) => "scheduler restarted before the run recorded its pid; not replayed".into(),
             };
             job.state.last_status = Some(Status::Interrupted);
             records.push(record(&job.spec.id, &r, now, Status::Interrupted, Some(detail)));
@@ -197,9 +231,8 @@ fn record(job_id: &str, r: &Running, now: DateTime<Utc>, status: Status, detail:
 }
 
 /// Start everything that is due. Returns how long the loop may sleep.
-fn tick(d: &Arc<Daemon>, now: DateTime<Utc>) -> Duration {
+fn tick(d: &Arc<Daemon>, st: &mut State, now: DateTime<Utc>) -> Duration {
     let mut starts = vec![];
-    let mut st = d.state.lock().unwrap();
     let mut changed = false;
     let mut skipped = vec![];
     for job in st
@@ -218,6 +251,7 @@ fn tick(d: &Arc<Daemon>, now: DateTime<Utc>) -> Duration {
                 let r = Running {
                     run_id: new_run_id(),
                     pid: None,
+                    pid_start: None,
                     started_at: now,
                     trigger: Trigger::Schedule,
                     slot: Some(slot),
@@ -236,6 +270,7 @@ fn tick(d: &Arc<Daemon>, now: DateTime<Utc>) -> Duration {
                 let r = Running {
                     run_id: new_run_id(),
                     pid: None,
+                    pid_start: None,
                     started_at: now,
                     trigger,
                     slot: Some(slot),
@@ -251,7 +286,7 @@ fn tick(d: &Arc<Daemon>, now: DateTime<Utc>) -> Duration {
         st.push_run(r);
     }
     if changed {
-        save(d, &st);
+        save(d, st);
     }
     let soonest = st
         .jobs
@@ -259,7 +294,6 @@ fn tick(d: &Arc<Daemon>, now: DateTime<Utc>) -> Duration {
         .filter(|j| j.spec.enabled && j.state.running.is_none())
         .filter_map(|j| j.state.next_run_at)
         .min();
-    drop(st);
     for (spec, r) in starts {
         spawn_run(d.clone(), spec, r, None);
     }
@@ -275,7 +309,36 @@ fn save(d: &Daemon, st: &State) {
     }
 }
 
+/// Record a just-spawned process group in `live`. Returns why the scheduler
+/// already wants it stopped (shutdown or remove raced the spawn), if so.
+fn track_pgid(d: &Daemon, key: &str, pgid: i32) -> Option<&'static str> {
+    let mut live = d.live.lock().unwrap();
+    let e = live.entry(key.to_string()).or_default();
+    e.pgid = Some(pgid);
+    e.stopped
+}
+
+/// Mark a tracked run as stopped by the scheduler and SIGTERM its group.
+/// A run that has not spawned yet sees the mark and never starts.
+fn stop_run(d: &Daemon, key: &str, why: &'static str) {
+    let pgid = {
+        let mut live = d.live.lock().unwrap();
+        let Some(e) = live.get_mut(key) else { return };
+        if e.stopped.is_some() {
+            return;
+        }
+        e.stopped = Some(why);
+        e.pgid
+    };
+    if let Some(p) = pgid {
+        runner::signal_group(p, libc::SIGTERM);
+    }
+}
+
+/// Call with the state lock held (or before the run is visible to anyone),
+/// so `live` is filled in before shutdown could look for it.
 fn spawn_run(d: Arc<Daemon>, spec: JobSpec, r: Running, done: Option<Sender<RunRecord>>) {
+    d.live.lock().unwrap().insert(r.run_id.clone(), Live::default());
     thread::spawn(move || {
         let env = [
             ("BOSS_SCHED_JOB_ID", spec.id.clone()),
@@ -283,35 +346,59 @@ fn spawn_run(d: Arc<Daemon>, spec: JobSpec, r: Running, done: Option<Sender<RunR
             ("BOSS_SCHED_SLOT", r.slot.map(|s| s.to_rfc3339()).unwrap_or_default()),
         ];
         let mut rec = record(&spec.id, &r, Utc::now(), Status::SpawnError, None);
-        match runner::start(&spec, &env) {
-            Err(e) => rec.detail = Some(format!("spawn {:?}: {e}", spec.command[0])),
-            Ok(started) => {
-                let pid = started.pid();
-                {
-                    let mut st = d.state.lock().unwrap();
-                    if let Some(run) = st.job_mut(&spec.id).and_then(|j| j.state.running.as_mut()) {
-                        run.pid = Some(pid);
+        let stopped_early = d.live.lock().unwrap().get(&r.run_id).and_then(|e| e.stopped);
+        if d.shutting_down.load(Ordering::SeqCst) || stopped_early.is_some() {
+            rec.status = Status::Interrupted;
+            rec.detail = Some(if stopped_early == Some(STOPPED_REMOVED) {
+                "job was removed before the run started".into()
+            } else {
+                "scheduler was shutting down; run not started".into()
+            });
+        } else {
+            match runner::start(&spec, &env) {
+                Err(e) => rec.detail = Some(format!("spawn {:?}: {e}", spec.command[0])),
+                Ok(started) => {
+                    let pid = started.pid();
+                    let pid_start = runner::process_start(pid);
+                    if track_pgid(&d, &r.run_id, pid as i32).is_some() {
+                        runner::signal_group(pid as i32, libc::SIGTERM);
                     }
-                    save(&d, &st);
-                }
-                log(format!(
-                    "job {} run {} started pid {pid} ({:?})",
-                    spec.id, r.run_id, r.trigger
-                ));
-                let o = runner::wait(
-                    started,
-                    Duration::from_secs(spec.timeout_seconds),
-                    Duration::from_secs(spec.kill_grace_seconds),
-                );
-                rec.status = o.status;
-                rec.exit_code = o.exit_code;
-                rec.signal = o.signal;
-                rec.detail = o.detail;
-                rec.stdout = o.stdout;
-                rec.stderr = o.stderr;
-                if d.shutting_down.load(Ordering::SeqCst) && o.status != Status::Success {
-                    rec.status = Status::Interrupted;
-                    rec.detail = Some("scheduler shut down during the run; process group terminated".into());
+                    {
+                        let mut st = d.state.lock().unwrap();
+                        if let Some(run) = st
+                            .job_mut(&spec.id)
+                            .and_then(|j| j.state.running.as_mut())
+                            .filter(|run| run.run_id == r.run_id)
+                        {
+                            run.pid = Some(pid);
+                            run.pid_start = pid_start;
+                        }
+                        save(&d, &st);
+                    }
+                    log(format!(
+                        "job {} run {} started pid {pid} ({:?})",
+                        spec.id, r.run_id, r.trigger
+                    ));
+                    let o = runner::wait(
+                        started,
+                        Duration::from_secs(spec.timeout_seconds),
+                        Duration::from_secs(spec.kill_grace_seconds),
+                    );
+                    rec.status = o.status;
+                    rec.exit_code = o.exit_code;
+                    rec.signal = o.signal;
+                    rec.detail = o.detail;
+                    rec.stdout = o.stdout;
+                    rec.stderr = o.stderr;
+                    // Only a run the scheduler ended counts as interrupted; one
+                    // that failed or timed out on its own keeps its real status.
+                    let stopped = d.live.lock().unwrap().get(&r.run_id).and_then(|e| e.stopped);
+                    if let Some(why) = stopped
+                        && o.status != Status::Success
+                    {
+                        rec.status = Status::Interrupted;
+                        rec.detail = Some(why.into());
+                    }
                 }
             }
         }
@@ -321,11 +408,22 @@ fn spawn_run(d: Arc<Daemon>, spec: JobSpec, r: Running, done: Option<Sender<RunR
             let mut st = d.state.lock().unwrap();
             let n = apply_outcome(&mut st, &rec, Utc::now());
             save(&d, &st);
+            // Under the lock: the main loop is either waiting (and wakes) or
+            // has not yet computed its next sleep (and sees this run gone).
+            d.wake.notify_all();
             n
         };
-        d.wake.notify_all();
+        // Register the notifier before this run leaves `live`, so shutdown
+        // never sees a gap with neither tracked.
+        let notify_key = format!("{}:notify", rec.run_id);
+        let notify = notify.filter(|_| !d.shutting_down.load(Ordering::SeqCst));
+        if notify.is_some() {
+            d.live.lock().unwrap().insert(notify_key.clone(), Live::default());
+        }
+        d.live.lock().unwrap().remove(&r.run_id);
         if let Some((argv, reason)) = notify {
-            run_notify(&spec, argv, &rec, reason);
+            run_notify(&d, &notify_key, &spec, argv, &rec, reason);
+            d.live.lock().unwrap().remove(&notify_key);
         }
         if let Some(tx) = done {
             let _ = tx.send(rec);
@@ -334,7 +432,21 @@ fn spawn_run(d: Arc<Daemon>, spec: JobSpec, r: Running, done: Option<Sender<RunR
 }
 
 /// Fold a finished run into job state. Returns an `on_failure` command to run, if any.
+/// A run is matched by run id, not job id: if its job was removed (and maybe
+/// re-added under the same id) the result is dropped rather than applied to
+/// a job it does not belong to.
 pub fn apply_outcome(st: &mut State, rec: &RunRecord, now: DateTime<Utc>) -> Option<(Vec<String>, String)> {
+    let current = st
+        .job(&rec.job_id)
+        .and_then(|j| j.state.running.as_ref())
+        .is_some_and(|r| r.run_id == rec.run_id);
+    if !current {
+        log(format!(
+            "job {} run {}: job was removed; result not recorded",
+            rec.job_id, rec.run_id
+        ));
+        return None;
+    }
     st.push_run(rec.clone());
     let job = st.job_mut(&rec.job_id)?;
     job.state.running = None;
@@ -379,7 +491,7 @@ pub fn apply_outcome(st: &mut State, rec: &RunRecord, now: DateTime<Utc>) -> Opt
     notify
 }
 
-fn run_notify(spec: &JobSpec, argv: Vec<String>, rec: &RunRecord, reason: String) {
+fn run_notify(d: &Daemon, key: &str, spec: &JobSpec, argv: Vec<String>, rec: &RunRecord, reason: String) {
     let mut n = spec.clone();
     n.command = argv;
     let env = [
@@ -389,8 +501,14 @@ fn run_notify(spec: &JobSpec, argv: Vec<String>, rec: &RunRecord, reason: String
         ("BOSS_SCHED_STATUS", format!("{:?}", rec.status).to_lowercase()),
         ("BOSS_SCHED_REASON", reason),
     ];
+    if d.live.lock().unwrap().get(key).and_then(|e| e.stopped).is_some() {
+        return;
+    }
     match runner::start(&n, &env) {
         Ok(s) => {
+            if track_pgid(d, key, s.pid() as i32).is_some() {
+                runner::signal_group(s.pid() as i32, libc::SIGTERM);
+            }
             let o = runner::wait(s, NOTIFY_TIMEOUT, Duration::from_secs(5));
             log(format!("job {} on_failure finished: {:?}", spec.id, o.status));
         }
@@ -398,37 +516,36 @@ fn run_notify(spec: &JobSpec, argv: Vec<String>, rec: &RunRecord, reason: String
     }
 }
 
-/// SIGTERM: stop every live run's process group (so updates leave no
-/// orphans), record them as interrupted, then exit.
+/// SIGTERM: stop every tracked run and notifier (including ones still
+/// spawning, which then never start), wait for their outcomes to be saved as
+/// interrupted, then exit. Updates leave no orphans.
 fn shutdown(d: &Arc<Daemon>) {
-    d.shutting_down.store(true, Ordering::SeqCst);
-    let live = |d: &Daemon| -> Vec<i32> {
-        d.state
-            .lock()
-            .unwrap()
-            .jobs
-            .iter()
-            .filter_map(|j| j.state.running.as_ref().and_then(|r| r.pid))
-            .map(|p| p as i32)
-            .collect()
-    };
-    let pids = live(d);
-    if pids.is_empty() {
+    {
+        // Under the state lock: a request handler either registered its run
+        // in `live` before this point, or sees the flag and refuses.
+        let _st = d.state.lock().unwrap();
+        d.shutting_down.store(true, Ordering::SeqCst);
+    }
+    let keys = |d: &Daemon| -> Vec<String> { d.live.lock().unwrap().keys().cloned().collect() };
+    let n = keys(d).len();
+    if n == 0 {
         return;
     }
-    log(format!("shutting down; terminating {} live run(s)", pids.len()));
-    for p in &pids {
-        runner::signal_group(*p, libc::SIGTERM);
-    }
+    log(format!("shutting down; terminating {n} live run(s)"));
+    // Re-sweep while waiting: a run mid-spawn gets its pgid after the first pass.
     let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
-    while !live(d).is_empty() && std::time::Instant::now() < deadline {
+    while !keys(d).is_empty() && std::time::Instant::now() < deadline {
+        for k in keys(d) {
+            stop_run(d, &k, STOPPED_SHUTDOWN);
+        }
         thread::sleep(Duration::from_millis(100));
     }
-    for p in live(d) {
-        runner::signal_group(p, libc::SIGKILL);
-    }
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while !live(d).is_empty() && std::time::Instant::now() < deadline {
+    while !keys(d).is_empty() && std::time::Instant::now() < deadline {
+        let pgids: Vec<i32> = d.live.lock().unwrap().values().filter_map(|e| e.pgid).collect();
+        for p in pgids {
+            runner::signal_group(p, libc::SIGKILL);
+        }
         thread::sleep(Duration::from_millis(100));
     }
 }
@@ -499,11 +616,22 @@ fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value, String> {
         }
         "remove" => {
             let id = id_arg(req)?;
-            let before = st.jobs.len();
-            st.jobs.retain(|j| j.spec.id != id);
-            if st.jobs.len() == before {
-                return Err("no such job".into());
+            let job = st.job(&id).ok_or("no such job")?;
+            // A live run goes with its job: SIGTERM now, SIGKILL after the
+            // job's grace if it is still tracked. Shutdown also still sees it.
+            if let Some(r) = &job.state.running {
+                let (key, grace) = (r.run_id.clone(), Duration::from_secs(job.spec.kill_grace_seconds));
+                stop_run(d, &key, STOPPED_REMOVED);
+                let d2 = d.clone();
+                thread::spawn(move || {
+                    thread::sleep(grace);
+                    let pgid = d2.live.lock().unwrap().get(&key).and_then(|e| e.pgid);
+                    if let Some(p) = pgid {
+                        runner::signal_group(p, libc::SIGKILL);
+                    }
+                });
             }
+            st.jobs.retain(|j| j.spec.id != id);
             st.history.remove(&id);
             json!({"removed": id})
         }
@@ -521,6 +649,9 @@ fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value, String> {
             to_v(&*job)
         }
         "run_now" => {
+            if d.shutting_down.load(Ordering::SeqCst) || SIGNALED.load(Ordering::SeqCst) {
+                return Err("scheduler is shutting down".into());
+            }
             let job = st.job_mut(&id_arg(req)?).ok_or("no such job")?;
             if job.state.running.is_some() {
                 return Err("job is already running".into());
@@ -528,6 +659,7 @@ fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value, String> {
             let r = Running {
                 run_id: new_run_id(),
                 pid: None,
+                pid_start: None,
                 started_at: now,
                 trigger: Trigger::Manual,
                 slot: None,
@@ -536,10 +668,10 @@ fn handle(d: &Arc<Daemon>, req: &Value) -> Result<Value, String> {
             job.state.running = Some(r.clone());
             let spec = job.spec.clone();
             save(d, &st);
-            drop(st);
             let wait = req["wait"].as_bool().unwrap_or(false);
             let (tx, rx) = mpsc::channel();
             spawn_run(d.clone(), spec, r.clone(), wait.then_some(tx));
+            drop(st);
             return if wait {
                 rx.recv()
                     .map(|rec| to_v(&rec))
@@ -601,16 +733,42 @@ mod tests {
         st
     }
 
-    fn rec(status: Status) -> RunRecord {
-        let r = Running {
+    fn running() -> Running {
+        Running {
             run_id: new_run_id(),
             pid: None,
+            pid_start: None,
             started_at: Utc::now(),
             trigger: Trigger::Schedule,
             slot: None,
             missed_slots: 1,
-        };
+        }
+    }
+
+    /// Start a run of job "j" and return the record it finishes with.
+    fn rec(st: &mut State, status: Status) -> RunRecord {
+        let r = running();
+        st.jobs[0].state.running = Some(r.clone());
         record("j", &r, Utc::now(), status, None)
+    }
+
+    #[test]
+    fn stale_run_does_not_touch_a_re_added_job() {
+        let mut st = state_with(false);
+        let old = rec(&mut st, Status::Failed);
+        // Removed and re-added under the same id; the new job is running.
+        st.jobs = state_with(false).jobs;
+        let new = running();
+        st.jobs[0].state.running = Some(new.clone());
+        assert!(apply_outcome(&mut st, &old, Utc::now()).is_none());
+        let j = &st.jobs[0].state;
+        assert_eq!(j.running.as_ref().map(|r| r.run_id.as_str()), Some(new.run_id.as_str()));
+        assert_eq!((j.consecutive_failures, j.last_status), (0, None));
+        assert!(st.history.is_empty(), "removed job's history must not come back");
+        // A run whose job is gone entirely is dropped too.
+        st.jobs.clear();
+        assert!(apply_outcome(&mut st, &old, Utc::now()).is_none());
+        assert!(st.history.is_empty());
     }
 
     #[test]
@@ -618,7 +776,10 @@ mod tests {
         let mut st = state_with(true);
         let mut notified = vec![];
         for i in 1..=5 {
-            if let Some((_, why)) = apply_outcome(&mut st, &rec(Status::Failed), Utc::now()) {
+            if let Some((_, why)) = {
+                let r = rec(&mut st, Status::Failed);
+                apply_outcome(&mut st, &r, Utc::now())
+            } {
                 notified.push((i, why));
             }
             assert_eq!(st.jobs[0].spec.enabled, i < 5, "after failure {i}");
@@ -641,10 +802,12 @@ mod tests {
     fn success_resets_counter_and_skips_do_not_count() {
         let mut st = state_with(false);
         for s in [Status::Failed, Status::Timeout, Status::Skipped, Status::Interrupted] {
-            apply_outcome(&mut st, &rec(s), Utc::now());
+            let r = rec(&mut st, s);
+            apply_outcome(&mut st, &r, Utc::now());
         }
         assert_eq!(st.jobs[0].state.consecutive_failures, 2);
-        apply_outcome(&mut st, &rec(Status::Success), Utc::now());
+        let r = rec(&mut st, Status::Success);
+        apply_outcome(&mut st, &r, Utc::now());
         assert_eq!(st.jobs[0].state.consecutive_failures, 0);
         assert!(st.jobs[0].spec.enabled);
     }
@@ -655,19 +818,30 @@ mod tests {
         let next = Utc::now() + chrono::Duration::hours(1);
         st.jobs[0].state.next_run_at = Some(next);
         st.jobs[0].state.running = Some(Running {
-            run_id: "r1".into(),
             pid: Some(999_999),
-            started_at: Utc::now(),
-            trigger: Trigger::Schedule,
-            slot: None,
-            missed_slots: 1,
+            ..running()
         });
-        recover(&mut st, Utc::now());
+        recover(&mut st, Utc::now(), Duration::from_secs(1));
         assert!(st.jobs[0].state.running.is_none());
         assert_eq!(st.jobs[0].state.next_run_at, Some(next));
         let h = &st.history["j"];
         assert_eq!((h.len(), h[0].status), (1, Status::Interrupted));
         assert!(h[0].detail.as_deref().unwrap().contains("pid 999999 gone"));
+    }
+
+    #[test]
+    fn recover_never_signals_a_reused_pid() {
+        // A live pid (this test process) whose start time does not match the
+        // recorded one is someone else's process; signalling it would kill us.
+        let mut st = state_with(false);
+        let me = std::process::id();
+        st.jobs[0].state.running = Some(Running {
+            pid: Some(me),
+            pid_start: runner::process_start(me).map(|s| s + 1),
+            ..running()
+        });
+        recover(&mut st, Utc::now(), Duration::from_secs(1));
+        assert!(st.history["j"][0].detail.as_deref().unwrap().contains("gone"));
     }
 
     #[test]

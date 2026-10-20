@@ -79,6 +79,9 @@ pub struct JobState {
 pub struct Running {
     pub run_id: String,
     pub pid: Option<u32>,
+    /// `runner::process_start` of `pid`, so recovery never signals a reused pid.
+    #[serde(default)]
+    pub pid_start: Option<u64>,
     pub started_at: DateTime<Utc>,
     pub trigger: Trigger,
     pub slot: Option<DateTime<Utc>>,
@@ -243,6 +246,11 @@ pub fn plan(
         latest = n;
         missed += 1;
         if missed >= MAX_SLOT_WALK {
+            // Measure lateness from the real latest slot, not where the walk
+            // stopped; `missed` is then a lower bound.
+            if let Some(l) = last_slot_at_or_before(&step, latest, now) {
+                latest = l;
+            }
             upcoming = step(now);
             break;
         }
@@ -263,6 +271,26 @@ pub fn plan(
         Decision::Run { slot: latest, missed }
     };
     (decision, upcoming)
+}
+
+/// Most recent slot in (`floor`, `now`], found by widening a window back from
+/// `now` so the walk stays short however far behind `floor` is.
+fn last_slot_at_or_before(
+    step: &impl Fn(DateTime<Utc>) -> Option<DateTime<Utc>>,
+    floor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let mut back = Duration::minutes(1);
+    while now - back > floor {
+        if let Some(mut s) = step(now - back).filter(|s| *s <= now) {
+            while let Some(n) = step(s).filter(|n| *n <= now) {
+                s = n;
+            }
+            return Some(s);
+        }
+        back = back * 2;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -376,7 +404,19 @@ mod tests {
     fn huge_gap_is_bounded() {
         let s = spec("* * * * *", 120);
         let (d, n) = plan(&s, Some(t("2020-01-01T00:00:00Z")), t("2026-10-19T10:00:30Z"));
-        assert!(matches!(d, Decision::Skip { .. }));
+        // The walk is capped, but lateness is still measured from the 10:00
+        // slot (30s ago), so it runs rather than being skipped.
+        assert_eq!(
+            d,
+            Decision::Run {
+                slot: t("2026-10-19T10:00:00Z"),
+                missed: MAX_SLOT_WALK
+            }
+        );
         assert_eq!(n, Some(t("2026-10-19T10:01:00Z")));
+        // A sparse schedule far behind finds its latest slot too.
+        let s = spec("17 9 1 * *", 3600);
+        let (d, _) = plan(&s, Some(t("2026-10-01T09:17:00Z")), t("2026-10-19T10:00:00Z"));
+        assert!(matches!(d, Decision::Skip { slot, .. } if slot == t("2026-10-01T09:17:00Z")));
     }
 }

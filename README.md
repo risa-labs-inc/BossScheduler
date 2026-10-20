@@ -2,8 +2,8 @@
 
 A tiny, always-on job scheduler for the BOSS desktop workspace. One native
 binary, `boss-sched`, that knows when jobs are due, spawns them as child
-processes, and records what happened. macOS first; it also builds and runs on
-Linux (everything except `install-agent`).
+processes, and records what happened. Runs on macOS (launchd) and Linux
+(systemd). Windows is not supported.
 
 ## The one-job rule
 
@@ -24,7 +24,8 @@ Rules that keep it small:
 - All state is on disk. The process can be killed at any moment and restarted
   without losing a job, a schedule position or a run record.
 - One instance per home directory, enforced by an `flock` held for the life of
-  the process. A second copy exits 0, so launchd `KeepAlive` does not loop.
+  the process. A second copy exits 0, and the service files restart only on
+  failure, so a duplicate does not loop.
 - Children never inherit the lock or the socket (close-on-exec).
 
 ## Install
@@ -61,7 +62,7 @@ Files in the home directory:
 | `state.json` | jobs, their schedule state, run history |
 | `scheduler.lock` | single-instance `flock`; contains the holder's pid |
 | `scheduler.sock` | control socket, mode 0600 |
-| `daemon.log` | stdout/stderr when run by launchd |
+| `daemon.log` | stdout/stderr when run by launchd or systemd |
 
 The home directory defaults to `~/.boss/scheduler`; override with `--home DIR`
 or `BOSS_SCHED_HOME`.
@@ -142,13 +143,21 @@ shown by `list`, and `on_failure` runs once more. `enable` resets the counter.
 `delete_after_success` it is removed after a successful scheduled run; its
 history is kept.
 
-**Restarts.** The pid of every live run is in `state.json`. On SIGTERM or
-SIGINT (which is what `launchctl kickstart -k` and `bootout` send) the daemon
-SIGTERMs every live run's process group, escalates to SIGKILL after 10 s,
-records those runs as `interrupted`, and exits. If the daemon dies hard
-(SIGKILL, crash), the next start finds the stale entries and records them as
-`interrupted`, noting whether the pid is still alive. Payloads are never
-replayed; the slot is considered consumed.
+**Restarts.** The pid of every live run, and that process's start time, are
+in `state.json`. On SIGTERM or SIGINT (what `launchctl kickstart -k`,
+`bootout` and `systemctl stop` send) the daemon stops accepting `run-now`,
+SIGTERMs every live run's process group (including runs still spawning and
+`on_failure` commands), escalates to SIGKILL after 10 s, records those runs as
+`interrupted`, and exits. A run that failed or timed out on its own just
+before keeps its real status. If the daemon dies hard (SIGKILL, crash), the
+next start finds the stale entries, terminates any leftover process group
+whose pid and start time still match (a reused pid is never signalled), and
+records them as `interrupted`. Payloads are never replayed; the slot is
+considered consumed.
+
+**Removing a running job** stops its run too (SIGTERM, then SIGKILL after
+`kill_grace_seconds`). Results are matched to runs by run id, so a run of a
+removed job never lands on a new job added under the same id.
 
 ## CLI
 
@@ -212,8 +221,9 @@ boss-sched install-agent     # writes ~/Library/LaunchAgents/ai.rever.boss.sched
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.rever.boss.scheduler.plist
 ```
 
-`install-agent` only writes the plist (absolute binary path, `RunAtLoad`,
-`KeepAlive`, log to `~/.boss/scheduler/daemon.log`, and your current `PATH`
+`install-agent` only writes the plist (absolute binary and home paths,
+`RunAtLoad`, `KeepAlive` with `SuccessfulExit` false so only a failure
+restarts it, log to `~/.boss/scheduler/daemon.log`, and your current `PATH`
 so jobs can find tools). It never calls `launchctl`; loading is your step.
 `print-agent` shows what it would write, and
 `launchd/ai.rever.boss.scheduler.plist.template` is the same thing with
@@ -237,21 +247,22 @@ slot that came due in between. Restarting at any time is safe. The cost is that
 a run in flight during an update is interrupted rather than finished; it is not
 retried until its next slot (or a manual `run-now`).
 
-## Linux
+## Running it under systemd (Linux)
 
-Everything except `install-agent` works. A systemd user unit equivalent:
-
-```ini
-# ~/.config/systemd/user/boss-scheduler.service
-[Service]
-ExecStart=/ABSOLUTE/PATH/TO/boss-sched daemon
-Restart=always
-KillMode=process
-[Install]
-WantedBy=default.target
+```bash
+boss-sched install-agent     # writes ~/.config/systemd/user/boss-scheduler.service
+systemctl --user daemon-reload
+systemctl --user enable --now boss-scheduler.service
+loginctl enable-linger $USER # optional: keep running while logged out
 ```
 
-`KillMode=process` leaves the job groups to the daemon's own shutdown handling.
+The unit has the absolute binary and home paths, your current `PATH`,
+`Restart=on-failure` and appends to `~/.boss/scheduler/daemon.log`. It uses
+`KillMode=mixed`: `systemctl stop` sends SIGTERM to the daemon alone, which
+stops its job groups and records them as `interrupted` itself; systemd only
+SIGKILLs whatever is left after that. To update, replace the binary and run
+`systemctl --user restart boss-scheduler.service`. `uninstall-agent` removes
+the file; stop it with `systemctl --user disable --now boss-scheduler.service`.
 
 ## Example job
 
