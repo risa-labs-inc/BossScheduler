@@ -221,9 +221,10 @@ boss-sched install-agent     # writes ~/Library/LaunchAgents/ai.rever.boss.sched
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.rever.boss.scheduler.plist
 ```
 
-`install-agent` only writes the plist (absolute binary and home paths,
-`RunAtLoad`, `KeepAlive` with `SuccessfulExit` false so only a failure
-restarts it, log to `~/.boss/scheduler/daemon.log`, and your current `PATH`
+`install-agent` only writes the plist (the absolute binary path, plus
+`--home` with an absolute path only when you use a custom home from `--home`
+or `BOSS_SCHED_HOME`, `RunAtLoad`, `KeepAlive` with `SuccessfulExit` false
+so only a failure restarts it, log to `~/.boss/scheduler/daemon.log`, and your current `PATH`
 so jobs can find tools). It never calls `launchctl`; loading is your step.
 `print-agent` shows what it would write, and
 `launchd/ai.rever.boss.scheduler.plist.template` is the same thing with
@@ -256,7 +257,8 @@ systemctl --user enable --now boss-scheduler.service
 loginctl enable-linger $USER # optional: keep running while logged out
 ```
 
-The unit has the absolute binary and home paths, your current `PATH`,
+The unit has the absolute binary path (plus `--home` with an absolute path
+only for a custom home from `--home` or `BOSS_SCHED_HOME`), your current `PATH`,
 `Restart=on-failure` and appends to `~/.boss/scheduler/daemon.log`. It uses
 `KillMode=mixed`: `systemctl stop` sends SIGTERM to the daemon alone, which
 stops its job groups and records them as `interrupted` itself; systemd only

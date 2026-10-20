@@ -71,9 +71,19 @@ fn sd_quote(s: &str) -> String {
     format!("\"{s}\"")
 }
 
+/// Quote one `Environment=` assignment. Unlike `ExecStart=`, systemd does not
+/// expand `$` there, so `$` stays as is; `"` and `\` are escaped and `%`
+/// (specifiers) is doubled.
+fn sd_env_quote(s: &str) -> String {
+    let s = s.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%");
+    format!("\"{s}\"")
+}
+
 /// Render the systemd user unit. `KillMode=mixed`: stop sends SIGTERM to the
 /// daemon alone, which terminates its job groups itself and records them as
-/// interrupted; anything still left after that is SIGKILLed by systemd.
+/// interrupted; anything still left after that is SIGKILLed by systemd. If
+/// the daemon itself crashes, systemd SIGKILLs its remaining job processes
+/// too, so on Linux startup recovery normally finds them already gone.
 pub fn systemd_unit(bin: &Path, home: Option<&Path>, log: &Path, path_env: &str) -> String {
     let mut exec = sd_quote(&bin.display().to_string());
     if let Some(h) = home {
@@ -98,7 +108,7 @@ StandardError=append:{log}
 [Install]
 WantedBy=default.target
 ",
-        sd_quote(&format!("PATH={path_env}"))
+        sd_env_quote(&format!("PATH={path_env}"))
     )
 }
 
@@ -111,13 +121,19 @@ fn target() -> Result<(PathBuf, Render), String> {
     if cfg!(target_os = "macos") {
         Ok((home.join("Library/LaunchAgents").join(format!("{LABEL}.plist")), plist))
     } else if cfg!(target_os = "linux") {
-        let config = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".config"));
+        let config = xdg_config_home(std::env::var("XDG_CONFIG_HOME").ok(), &home);
         Ok((config.join("systemd/user").join(UNIT), systemd_unit))
     } else {
         Err("install-agent supports macOS (launchd) and Linux (systemd) only".into())
     }
+}
+
+/// `$XDG_CONFIG_HOME`, ignored when empty or relative (per the XDG spec),
+/// falling back to `~/.config`.
+fn xdg_config_home(var: Option<String>, home: &Path) -> PathBuf {
+    var.map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
 }
 
 /// What install-agent would write, for this OS.
@@ -210,7 +226,7 @@ mod tests {
             Path::new("/opt/boss sched/boss-sched"),
             Some(Path::new("/h/50%$x")),
             Path::new("/h/50%$x/daemon.log"),
-            "/usr/bin:/bin",
+            "/usr/bin:/opt/50%$y/bin",
         );
         assert!(
             u.contains("ExecStart=\"/opt/boss sched/boss-sched\" --home \"/h/50%%$$x\" daemon\n"),
@@ -218,11 +234,24 @@ mod tests {
         );
         assert!(u.contains("Restart=on-failure\n"));
         assert!(u.contains("KillMode=mixed\n"));
-        assert!(u.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
+        // Environment= does not expand `$`, so it must not be doubled there.
+        assert!(u.contains("Environment=\"PATH=/usr/bin:/opt/50%%$y/bin\"\n"), "{u}");
         assert!(u.contains("StandardOutput=append:/h/50%%$x/daemon.log\n"));
         assert!(u.contains("WantedBy=default.target"));
         let u = systemd_unit(Path::new("/b"), None, Path::new("/l"), "/p");
         assert!(u.contains("ExecStart=\"/b\" daemon\n"));
+    }
+
+    #[test]
+    fn xdg_config_home_ignores_empty_and_relative() {
+        let home = Path::new("/u");
+        assert_eq!(xdg_config_home(None, home), PathBuf::from("/u/.config"));
+        assert_eq!(xdg_config_home(Some(String::new()), home), PathBuf::from("/u/.config"));
+        assert_eq!(
+            xdg_config_home(Some("rel/cfg".into()), home),
+            PathBuf::from("/u/.config")
+        );
+        assert_eq!(xdg_config_home(Some("/x/cfg".into()), home), PathBuf::from("/x/cfg"));
     }
 
     #[test]

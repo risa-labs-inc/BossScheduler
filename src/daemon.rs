@@ -195,6 +195,12 @@ pub fn recover(state: &mut State, now: DateTime<Utc>, grace: Duration) {
                         "scheduler restarted while run was live (pid {pid} still alive, process group terminated); not replayed"
                     )
                 }
+                // Alive (kill(0) succeeds, or EPERM but its start time is
+                // readable) yet unverified: reused, or an old state file
+                // without `pid_start`. Never signalled.
+                (Some(pid), None) if runner::pid_alive(pid) || runner::process_start(pid).is_some() => format!(
+                    "scheduler restarted while run was live (pid {pid} no longer ours: reused or unverifiable, left untouched); not replayed"
+                ),
                 (Some(pid), None) => format!("scheduler restarted while run was live (pid {pid} gone); not replayed"),
                 // A crash between spawn and saving the pid lands here; that
                 // child cannot be identified, so it is left alone.
@@ -335,11 +341,30 @@ fn stop_run(d: &Daemon, key: &str, why: &'static str) {
     }
 }
 
+/// Removes a `live` entry when dropped, so a run thread that panics still
+/// leaves `live` and shutdown does not wait out its full grace for it. Takes
+/// only the `live` lock (fine with or without `state` held, per the lock
+/// order) and tolerates a poisoned one, so it cannot panic while unwinding.
+struct LiveEntry<'a> {
+    d: &'a Daemon,
+    key: String,
+}
+
+impl Drop for LiveEntry<'_> {
+    fn drop(&mut self) {
+        self.d.live.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+    }
+}
+
 /// Call with the state lock held (or before the run is visible to anyone),
 /// so `live` is filled in before shutdown could look for it.
 fn spawn_run(d: Arc<Daemon>, spec: JobSpec, r: Running, done: Option<Sender<RunRecord>>) {
     d.live.lock().unwrap().insert(r.run_id.clone(), Live::default());
     thread::spawn(move || {
+        let run_entry = LiveEntry {
+            d: &d,
+            key: r.run_id.clone(),
+        };
         let env = [
             ("BOSS_SCHED_JOB_ID", spec.id.clone()),
             ("BOSS_SCHED_RUN_ID", r.run_id.clone()),
@@ -417,14 +442,18 @@ fn spawn_run(d: Arc<Daemon>, spec: JobSpec, r: Running, done: Option<Sender<RunR
         // never sees a gap with neither tracked.
         let notify_key = format!("{}:notify", rec.run_id);
         let notify = notify.filter(|_| !d.shutting_down.load(Ordering::SeqCst));
-        if notify.is_some() {
+        let notify_entry = notify.is_some().then(|| {
             d.live.lock().unwrap().insert(notify_key.clone(), Live::default());
-        }
-        d.live.lock().unwrap().remove(&r.run_id);
+            LiveEntry {
+                d: &d,
+                key: notify_key.clone(),
+            }
+        });
+        drop(run_entry);
         if let Some((argv, reason)) = notify {
             run_notify(&d, &notify_key, &spec, argv, &rec, reason);
-            d.live.lock().unwrap().remove(&notify_key);
         }
+        drop(notify_entry);
         if let Some(tx) = done {
             let _ = tx.send(rec);
         }
@@ -841,7 +870,23 @@ mod tests {
             ..running()
         });
         recover(&mut st, Utc::now(), Duration::from_secs(1));
-        assert!(st.history["j"][0].detail.as_deref().unwrap().contains("gone"));
+        let d = st.history["j"][0].detail.clone().unwrap();
+        assert!(d.contains(&format!("pid {me} no longer ours")), "{d}");
+        assert!(!d.contains("gone"), "{d}");
+        // An old state file with no recorded start time: alive but unverifiable.
+        st.jobs[0].state.running = Some(Running {
+            pid: Some(me),
+            pid_start: None,
+            ..running()
+        });
+        recover(&mut st, Utc::now(), Duration::from_secs(1));
+        let d = st.history["j"][1].detail.clone().unwrap();
+        assert!(
+            d.contains(&format!(
+                "pid {me} no longer ours: reused or unverifiable, left untouched"
+            )),
+            "{d}"
+        );
     }
 
     #[test]

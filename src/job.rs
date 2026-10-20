@@ -280,17 +280,23 @@ fn last_slot_at_or_before(
     floor: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    let latest_from = |from: DateTime<Utc>| {
+        let mut s = step(from).filter(|s| *s <= now)?;
+        while let Some(n) = step(s).filter(|n| *n <= now) {
+            s = n;
+        }
+        Some(s)
+    };
     let mut back = Duration::minutes(1);
     while now - back > floor {
-        if let Some(mut s) = step(now - back).filter(|s| *s <= now) {
-            while let Some(n) = step(s).filter(|n| *n <= now) {
-                s = n;
-            }
+        if let Some(s) = latest_from(now - back) {
             return Some(s);
         }
         back = back * 2;
     }
-    None
+    // The window overshot `floor`: slots in (floor, last checked point] were
+    // never examined, so look from `floor` itself.
+    latest_from(floor)
 }
 
 #[cfg(test)]
@@ -418,5 +424,21 @@ mod tests {
         let s = spec("17 9 1 * *", 3600);
         let (d, _) = plan(&s, Some(t("2026-10-01T09:17:00Z")), t("2026-10-19T10:00:00Z"));
         assert!(matches!(d, Decision::Skip { slot, .. } if slot == t("2026-10-01T09:17:00Z")));
+    }
+
+    #[test]
+    fn last_slot_found_when_window_overshoots_floor() {
+        // Checks 10:05, 10:04, 10:02 find nothing; the next window (09:58)
+        // is past the floor, so the 10:01 slot is only found from the floor.
+        let c = Cron::parse("1 10 * * *", "UTC").unwrap();
+        let step = |after| c.next_after(after);
+        assert_eq!(
+            last_slot_at_or_before(&step, t("2026-10-19T10:00:00Z"), t("2026-10-19T10:06:00Z")),
+            Some(t("2026-10-19T10:01:00Z"))
+        );
+        assert_eq!(
+            last_slot_at_or_before(&step, t("2026-10-19T10:01:00Z"), t("2026-10-19T10:06:00Z")),
+            None
+        );
     }
 }
