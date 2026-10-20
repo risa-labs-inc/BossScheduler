@@ -1,0 +1,110 @@
+# Release contract (consumed by BossConsole packaging; do not change lightly):
+#   https://github.com/risa-labs-inc/BossScheduler/releases/download/v<version>/boss-sched-<version>-<target>.tar.gz
+#   https://github.com/risa-labs-inc/BossScheduler/releases/download/v<version>/SHA256SUMS
+# Each archive holds a single `boss-sched` binary at its root. macOS binaries
+# are unsigned; BossConsole re-signs and notarizes them.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Read version and check it against the tag
+        run: |
+          set -eu
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "boss-scheduler") | .version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::could not read version from Cargo.toml"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version (expected v$version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest, smoke: true }
+          - { target: x86_64-apple-darwin, os: macos-latest, smoke: false }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, smoke: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, smoke: true }
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Smoke test
+        if: matrix.smoke
+        run: |
+          "target/$TARGET/release/boss-sched" --help | head -1
+      - name: Package
+        run: |
+          set -eu
+          archive="boss-sched-$VERSION-$TARGET.tar.gz"
+          mkdir -p dist
+          tar -C "target/$TARGET/release" -czf "dist/$archive" boss-sched
+          test "$(tar -tzf "dist/$archive")" = "boss-sched"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boss-sched-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: boss-sched-*
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -eu
+          test "$(ls *.tar.gz | wc -l)" -eq 4
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish release
+        run: |
+          set -eu
+          tag="v$VERSION"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "::error::release $tag already exists; bump the version instead of rebuilding a shipped release"
+            exit 1
+          fi
+          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS \
+            --title "$tag" \
+            --target "$GITHUB_SHA" \
+            --notes "Boss Scheduler $VERSION. Archives contain a single \`boss-sched\` binary; verify with SHA256SUMS. macOS binaries are unsigned."

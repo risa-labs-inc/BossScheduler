@@ -1,0 +1,11 @@
+{
+  "id": "morning-digest",
+  "name": "Weekday morning digest",
+  "schedule": { "kind": "cron", "expr": "0 8 * * 1-5", "tz": "America/Los_Angeles" },
+  "command": ["/bin/sh", "-c", "exec claude -p \"$(cat morning-digest-prompt.txt)\""],
+  "cwd": "~/.boss/scheduler/jobs/morning-digest",
+  "env": { "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" },
+  "timeout_seconds": 900,
+  "max_lateness_seconds": 1800,
+  "enabled": true
+}
