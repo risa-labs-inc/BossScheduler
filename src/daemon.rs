@@ -92,8 +92,10 @@ pub fn acquire_lock(path: &Path) -> std::io::Result<Option<File>> {
     Ok(Some(f))
 }
 
+/// Never panics (unlike `eprintln!`), so it is safe in `Drop` while unwinding.
 fn log(msg: impl AsRef<str>) {
-    eprintln!(
+    let _ = writeln!(
+        std::io::stderr().lock(),
         "{} boss-sched: {}",
         Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
         msg.as_ref()
@@ -363,11 +365,61 @@ impl Drop for LiveEntry<'_> {
     }
 }
 
+const ABANDONED: &str = "scheduler run thread crashed; run abandoned";
+
+/// Records a run as failed if its thread unwinds from a panic before saving
+/// an outcome, so the job is not left marked running (never scheduled again,
+/// `run-now` refused) until the next daemon restart. Declared before the
+/// run's `LiveEntry`, so it drops after it: the `live` lock is released and
+/// the group killed before this takes `state`, keeping the lock order. Takes
+/// a poisoned `state` lock too, so it cannot panic while unwinding.
+struct AbandonGuard<'a> {
+    d: &'a Daemon,
+    job_id: String,
+    run: Running,
+}
+
+impl Drop for AbandonGuard<'_> {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            return;
+        }
+        let mut st = self.d.state.lock().unwrap_or_else(|e| e.into_inner());
+        if abandon_run(&mut st, &self.job_id, &self.run, Utc::now()) {
+            save(self.d, &st);
+        }
+        self.d.wake.notify_all();
+    }
+}
+
+/// Record `run` of `job_id` as failed with `ABANDONED` if it is still the
+/// job's current run. A removed job, or one re-added and running under a new
+/// run id, is left alone. Returns whether anything changed. Any `on_failure`
+/// notify is dropped: a crashed run thread cannot run it.
+fn abandon_run(st: &mut State, job_id: &str, run: &Running, now: DateTime<Utc>) -> bool {
+    let current = st
+        .job(job_id)
+        .and_then(|j| j.state.running.as_ref())
+        .is_some_and(|r| r.run_id == run.run_id);
+    if !current {
+        return false;
+    }
+    log(format!("job {job_id} run {}: {ABANDONED}", run.run_id));
+    let rec = record(job_id, run, now, Status::Failed, Some(ABANDONED.into()));
+    let _ = apply_outcome(st, &rec, now);
+    true
+}
+
 /// Call with the state lock held (or before the run is visible to anyone),
 /// so `live` is filled in before shutdown could look for it.
 fn spawn_run(d: Arc<Daemon>, spec: JobSpec, r: Running, done: Option<Sender<RunRecord>>) {
     d.live.lock().unwrap().insert(r.run_id.clone(), Live::default());
     thread::spawn(move || {
+        let _abandon = AbandonGuard {
+            d: &d,
+            job_id: spec.id.clone(),
+            run: r.clone(),
+        };
         let run_entry = LiveEntry {
             d: &d,
             key: r.run_id.clone(),
@@ -805,6 +857,73 @@ mod tests {
         st.jobs.clear();
         assert!(apply_outcome(&mut st, &old, Utc::now()).is_none());
         assert!(st.history.is_empty());
+    }
+
+    #[test]
+    fn abandoned_run_is_recorded_failed_and_frees_the_job() {
+        let mut st = state_with(true);
+        let r = running();
+        st.jobs[0].state.running = Some(r.clone());
+        assert!(abandon_run(&mut st, "j", &r, Utc::now()));
+        let j = &st.jobs[0].state;
+        assert!(j.running.is_none(), "job must not stay running");
+        assert_eq!((j.last_status, j.consecutive_failures), (Some(Status::Failed), 1));
+        let h = &st.history["j"];
+        assert_eq!((h.len(), h[0].status), (1, Status::Failed));
+        assert_eq!(h[0].run_id, r.run_id);
+        assert_eq!(h[0].detail.as_deref(), Some(ABANDONED));
+        // A second cleanup of the same run is a no-op.
+        assert!(!abandon_run(&mut st, "j", &r, Utc::now()));
+        assert_eq!(st.history["j"].len(), 1);
+        // Removed and re-added, running under a new run id: left untouched.
+        st.jobs = state_with(true).jobs;
+        st.history.clear();
+        let new = running();
+        st.jobs[0].state.running = Some(new.clone());
+        assert!(!abandon_run(&mut st, "j", &r, Utc::now()));
+        let j = &st.jobs[0].state;
+        assert_eq!(j.running.as_ref().map(|r| r.run_id.as_str()), Some(new.run_id.as_str()));
+        assert_eq!((j.consecutive_failures, j.last_status), (0, None));
+        assert!(st.history.is_empty());
+    }
+
+    #[test]
+    fn panicking_run_thread_does_not_leave_the_job_running() {
+        // Drive the real guard: a thread that panics with it armed, then a
+        // poisoned state lock that the guard must still take.
+        let dir = std::env::temp_dir().join(format!("bsched-abandon-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut st = state_with(false);
+        let r = running();
+        st.jobs[0].state.running = Some(r.clone());
+        let d = Arc::new(Daemon {
+            paths: Paths::new(&dir),
+            state: Mutex::new(st),
+            wake: Condvar::new(),
+            shutting_down: AtomicBool::new(false),
+            started_at: Utc::now(),
+            live: Mutex::new(HashMap::new()),
+        });
+        let d2 = d.clone();
+        let (job_id, run) = ("j".to_string(), r.clone());
+        let res = thread::spawn(move || {
+            let _abandon = AbandonGuard { d: &d2, job_id, run };
+            // Panic while holding the state lock, so it is poisoned too.
+            let _st = d2.state.lock().unwrap();
+            panic!("simulated run thread crash");
+        })
+        .join();
+        assert!(res.is_err());
+        assert!(d.state.is_poisoned());
+        let st = d.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(st.jobs[0].state.running.is_none());
+        assert_eq!(st.history["j"][0].detail.as_deref(), Some(ABANDONED));
+        assert!(
+            State::load(&d.paths.state).unwrap().jobs[0].state.running.is_none(),
+            "saved"
+        );
+        drop(st);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

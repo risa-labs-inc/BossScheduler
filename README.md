@@ -153,7 +153,9 @@ before keeps its real status. If the daemon dies hard (SIGKILL, crash), the
 next start finds the stale entries, terminates any leftover process group
 whose pid and start time still match (a reused pid is never signalled), and
 records them as `interrupted`. Payloads are never replayed; the slot is
-considered consumed.
+considered consumed. If the daemon thread watching a run crashes instead, its
+process group (if spawned) is SIGKILLed and the run is recorded as `failed` ("scheduler run
+thread crashed; run abandoned"), so the job is scheduled again as usual.
 
 **Removing a running job** stops its run too (SIGTERM, then SIGKILL after
 `kill_grace_seconds`). Results are matched to runs by run id, so a run of a

@@ -90,7 +90,14 @@ pub fn wait(mut s: Started, timeout: Duration, grace: Duration) -> Outcome {
         kill_group(&mut s.child, pgid, &mut status, grace);
         detail = Some("leader exited; leftover processes in its group were terminated".to_string());
     }
-    let st = status.expect("reaped");
+    let Some(st) = status else {
+        return outcome(
+            Status::Failed,
+            None,
+            Some("could not reap the run's process".into()),
+            &s,
+        );
+    };
     let (code, sig) = (st.code(), st.signal());
     let (kind, detail) = if timed_out {
         (
