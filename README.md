@@ -241,9 +241,15 @@ The binary holds no state worth protecting, so updating is: replace the file,
 restart the service.
 
 ```bash
-cp target/release/boss-sched /path/the/plist/points/at/boss-sched
+dest=/path/the/plist/points/at/boss-sched
+cp target/release/boss-sched "$dest.new" && mv "$dest.new" "$dest"
 launchctl kickstart -k gui/$UID/ai.rever.boss.scheduler
 ```
+
+Copy to a new file and rename it over the old one; do not `cp` straight onto
+the installed binary. On macOS, overwriting a signed binary in place leaves
+the kernel's cached code signature stale, and every later launch of that file
+is killed (exit 137) until it is replaced by a new file.
 
 `kickstart -k` sends SIGTERM; the old process terminates live runs (recorded
 as `interrupted`), releases the lock and exits; launchd starts the new binary,
