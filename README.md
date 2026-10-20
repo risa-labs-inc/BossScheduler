@@ -228,7 +228,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.rever.boss.scheduler.
 or `BOSS_SCHED_HOME`), `RunAtLoad`, `KeepAlive` with `SuccessfulExit` false
 so only a failure restarts it, logging to `<home>/daemon.log` (by default
 `~/.boss/scheduler/daemon.log`), and your current `PATH` so jobs can find
-tools. It never calls `launchctl`; loading is your step.
+tools (entries starting with `~` are expanded to your home, since launchd
+does not expand them). It never calls `launchctl`; loading is your step.
 `print-agent` shows what it would write, and
 `launchd/ai.rever.boss.scheduler.plist.template` is the same thing with
 placeholders. `uninstall-agent` removes the file; unload with
@@ -240,9 +241,15 @@ The binary holds no state worth protecting, so updating is: replace the file,
 restart the service.
 
 ```bash
-cp target/release/boss-sched /path/the/plist/points/at/boss-sched
+dest=/path/the/plist/points/at/boss-sched
+cp target/release/boss-sched "$dest.new" && mv "$dest.new" "$dest"
 launchctl kickstart -k gui/$UID/ai.rever.boss.scheduler
 ```
+
+Copy to a new file and rename it over the old one; do not `cp` straight onto
+the installed binary. On macOS, overwriting a signed binary in place leaves
+the kernel's cached code signature stale, and every later launch of that file
+is killed (exit 137) until it is replaced by a new file.
 
 `kickstart -k` sends SIGTERM; the old process terminates live runs (recorded
 as `interrupted`), releases the lock and exits; launchd starts the new binary,
@@ -261,7 +268,8 @@ loginctl enable-linger $USER # optional: keep running while logged out
 ```
 
 The unit has the absolute binary path (plus `--home` with an absolute path
-only for a custom home from `--home` or `BOSS_SCHED_HOME`), your current `PATH`,
+only for a custom home from `--home` or `BOSS_SCHED_HOME`), your current `PATH`
+(entries starting with `~` expanded to your home),
 `Restart=on-failure` and appends to `<home>/daemon.log` (by default
 `~/.boss/scheduler/daemon.log`). It uses
 `KillMode=mixed`: `systemctl stop` sends SIGTERM to the daemon alone, which

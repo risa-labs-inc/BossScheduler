@@ -156,7 +156,28 @@ fn inputs(sched_home: &Path) -> Result<(PathBuf, PathBuf, String), String> {
         .map_err(|e| format!("locate binary: {e}"))?;
     let home = std::path::absolute(sched_home).map_err(|e| format!("resolve {}: {e}", sched_home.display()))?;
     let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    let path_env = service_path(&path_env, &std::env::var("HOME").unwrap_or_default());
     Ok((bin, home, path_env))
+}
+
+/// launchd and systemd do not expand `~`, so a login PATH entry like
+/// `~/.dotnet/tools` would be dead in the service file. Expands a leading `~`
+/// or `~/` to `home` (when known), drops empty entries and exact duplicates,
+/// keeping first-occurrence order.
+fn service_path(raw: &str, home: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw.split(':').filter(|e| !e.is_empty()) {
+        let entry = match entry.strip_prefix('~') {
+            Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+                format!("{}{rest}", home.trim_end_matches('/'))
+            }
+            _ => entry.to_string(),
+        };
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    out.join(":")
 }
 
 pub fn install(sched_home: &Path, custom_home: bool) -> Result<String, String> {
@@ -252,6 +273,17 @@ mod tests {
             PathBuf::from("/u/.config")
         );
         assert_eq!(xdg_config_home(Some("/x/cfg".into()), home), PathBuf::from("/x/cfg"));
+    }
+
+    #[test]
+    fn service_path_expands_tilde_and_dedupes() {
+        let raw = "~/.dotnet/tools:/usr/bin::~:/opt/a~b:~other/bin:/usr/bin:/u/.dotnet/tools:";
+        assert_eq!(
+            service_path(raw, "/u"),
+            "/u/.dotnet/tools:/usr/bin:/u:/opt/a~b:~other/bin"
+        );
+        assert_eq!(service_path("a::b", "/u"), "a:b");
+        assert_eq!(service_path("~/x", ""), "~/x");
     }
 
     #[test]
